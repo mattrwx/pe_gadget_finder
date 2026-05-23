@@ -113,11 +113,11 @@ static std::string get_section_name(const IMAGE_SECTION_HEADER& sec) {
     return std::string(buf);
 }
 
-static std::string disassemble_at(const uint8_t*   data,
-                                   size_t           max_len,
-                                   ZydisDecoder&    decoder,
-                                   ZydisFormatter&  formatter,
-                                   ZyanU64          runtime_addr) {
+static std::string disassemble_at(const uint8_t*                   data,
+                                   size_t                           max_len,
+                                   ZydisDecoder&                    decoder,
+                                   ZydisFormatter&                  formatter,
+                                   ZyanU64                          runtime_addr) {
     ZydisDecodedInstruction instr{};
     ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT]{};
 
@@ -227,6 +227,40 @@ std::vector<match_result> scan_pe(const fs::path&                  path,
     return results;
 }
 
+// Case-insensitive prefix match: does `instr` start with `filter`?
+// Whitespace in the filter is normalised so "mov  cr3" == "mov cr3".
+static std::string normalise_instr(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    bool last_space = false;
+    for (unsigned char c : s) {
+        if (std::isspace(c)) {
+            if (!last_space && !out.empty()) { out += ' '; last_space = true; }
+        } else {
+            out += (char)std::tolower(c);
+            last_space = false;
+        }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+static bool instr_matches_filter(const std::string& instr,
+                                  const std::string& norm_filter) {
+    if (norm_filter.empty()) return false;
+    std::string norm_instr = normalise_instr(instr);
+    if (norm_instr.size() < norm_filter.size()) return false;
+    // prefix match
+    if (norm_instr.substr(0, norm_filter.size()) != norm_filter) return false;
+    // make sure the match lands on a token boundary (end of string, space,
+    // or comma) so "mov cr3" doesn't match "mov cr30"
+    if (norm_instr.size() > norm_filter.size()) {
+        char next = norm_instr[norm_filter.size()];
+        if (next != ' ' && next != ',' && next != '\t') return false;
+    }
+    return true;
+}
+
 std::optional<std::string> get_arg(const std::string& arg,
                                     const std::string& key) {
     std::string prefix = "-" + key + "=";
@@ -245,15 +279,21 @@ void print_usage(const char* prog) {
     std::cout
         << "\nUsage:\n"
         << "  " << prog
-        << " -dir=\"<path>\" -pattern=\"<IDA pattern>\" [-bin=\"<output>\"] [-ALLFILE]\n\n"
+        << " -dir=\"<path>\" -pattern=\"<IDA pattern>\" [-bin=\"<output>\"] [-extension=\"<exts>\"] [-instruction=\"<text>\"] [-ALLFILE]\n\n"
         << "Options:\n"
-        << "  -dir=<path>      Directory to scan (recursive)\n"
-        << "  -pattern=<pat>   IDA-style hex pattern  e.g. \"0F 22 ? 05\"\n"
-        << "                   Use ? or ?? as single-byte wildcards\n"
-        << "  -bin=<file>      Output file (default: matches.txt)\n"
-        << "                   .txt is appended if no extension is given\n"
-        << "  -ALLFILE         Scan ALL sections, not just executable ones\n\n"
-        << "Supported PE extensions: .exe .dll .sys .ocx .scr .drv .efi .mui\n\n"
+        << "  -dir=<path>          Directory to scan (recursive)\n"
+        << "  -pattern=<pat>       IDA-style hex pattern  e.g. \"0F 22 ? 05\"\n"
+        << "                       Use ? or ?? as single-byte wildcards\n"
+        << "  -bin=<file>          Output file (default: matches.txt)\n"
+        << "                       .txt is appended if no extension is given\n"
+        << "  -extension=<exts>    Space-separated list of extensions to scan\n"
+        << "                       e.g. \"sys dll\" or \".sys .dll\"\n"
+        << "                       Default: exe dll sys ocx scr drv efi mui\n"
+        << "  -instruction=<text>  Prefix filter on disassembled instruction\n"
+        << "                       Matching rows are promoted to the top of the output\n"
+        << "                       e.g. \"mov cr3, rcx\" or \"mov cr3\" (partial ok)\n"
+        << "  -ALLFILE             Scan ALL sections, not just executable ones\n\n"
+        << "Supported PE extensions (default): .exe .dll .sys .ocx .scr .drv .efi .mui\n\n"
         << "Output format:\n"
         << "  RVA                | Section    | File                | Instruction\n\n";
 }
@@ -303,7 +343,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string dir_arg, pattern_arg, bin_file;
+    std::string dir_arg, pattern_arg, bin_file, ext_arg, instr_filter;
     bool all_file = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -314,9 +354,11 @@ int main(int argc, char* argv[]) {
                         [](unsigned char c){ return (char)std::toupper(c); });
         if (a_upper == "-ALLFILE") { all_file = true; continue; }
 
-        if (auto v = get_arg(a, "dir"))     { dir_arg     = *v; continue; }
-        if (auto v = get_arg(a, "pattern")) { pattern_arg = *v; continue; }
-        if (auto v = get_arg(a, "bin"))     { bin_file    = *v; continue; }
+        if (auto v = get_arg(a, "dir"))         { dir_arg      = *v; continue; }
+        if (auto v = get_arg(a, "pattern"))     { pattern_arg  = *v; continue; }
+        if (auto v = get_arg(a, "bin"))         { bin_file     = *v; continue; }
+        if (auto v = get_arg(a, "extension"))   { ext_arg      = *v; continue; }
+        if (auto v = get_arg(a, "instruction")) { instr_filter = *v; continue; }
 
         std::cerr << "[!] Unknown argument: " << a << "\n";
     }
@@ -334,6 +376,25 @@ int main(int argc, char* argv[]) {
 
     if (bin_file.empty()) bin_file = "matches";
     if (fs::path(bin_file).extension().empty()) bin_file += ".txt";
+
+    // Build extension list from -extension= arg, or fall back to defaults
+    std::vector<std::string> pe_exts;
+    if (!ext_arg.empty()) {
+        std::istringstream ess(ext_arg);
+        std::string tok;
+        while (ess >> tok) {
+            std::transform(tok.begin(), tok.end(), tok.begin(),
+                           [](unsigned char c){ return (char)std::tolower(c); });
+            if (tok.front() != '.') tok = '.' + tok;
+            pe_exts.push_back(tok);
+        }
+        if (pe_exts.empty()) {
+            std::cerr << "[!] -extension= was given but parsed to zero entries. Aborting.\n";
+            return 1;
+        }
+    } else {
+        pe_exts = { ".exe", ".dll", ".sys", ".ocx", ".scr", ".drv", ".efi", ".mui" };
+    }
 
     auto pat_bytes = parse_pattern(pattern_arg);
     if (pat_bytes.empty()) {
@@ -353,11 +414,10 @@ int main(int argc, char* argv[]) {
                                     << pat_bytes.size() << " byte(s))\n"
               << "[*] Output    : " << bin_file    << "\n"
               << "[*] Scope     : "
-                  << (all_file ? "all sections" : "executable sections only") << "\n\n";
-
-    static const std::vector<std::string> pe_exts = {
-        ".exe", ".dll", ".sys", ".ocx", ".scr", ".drv", ".efi", ".mui"
-    };
+                  << (all_file ? "all sections" : "executable sections only") << "\n"
+              << "[*] Extensions:";
+    for (const auto& e : pe_exts) std::cout << " " << e;
+    std::cout << "\n\n";
 
     std::vector<match_result> all_results;
     size_t file_count = 0;
@@ -384,6 +444,18 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\n\n";
+
+    // --- NEW INSTRUCTION FILTERING LOGIC ---
+    // If a filter was provided, move matching items to the top of the vector
+    // while preserving the original relative order for both groups
+    if (!instr_filter.empty()) {
+        std::string norm_filter = normalise_instr(instr_filter);
+        std::stable_partition(all_results.begin(), all_results.end(),
+            [&norm_filter](const match_result& m) {
+                return instr_matches_filter(m.instruction, norm_filter);
+            });
+    }
+    // ---------------------------------------
 
     const std::string hdr_rva   = "RVA";
     const std::string hdr_sec   = "Section";
@@ -412,7 +484,13 @@ int main(int argc, char* argv[]) {
              << "# Pattern  : " << pattern_arg << "\n"
              << "# Directory: " << dir_arg     << "\n"
              << "# Scope    : " << (all_file ? "all sections" : "executable sections only") << "\n"
-             << "#\n";
+             << "# Extensions:";
+    for (const auto& e : pe_exts) out_file << " " << e;
+    out_file << "\n";
+    if (!instr_filter.empty()) {
+        out_file << "# Filter   : " << instr_filter << " (matching items promoted to top)\n";
+    }
+    out_file << "#\n";
 
     write_row(out_file, hdr_rva, hdr_sec, hdr_file, hdr_instr,
               w_rva, w_sec, w_file);
